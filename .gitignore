@@ -165,7 +165,7 @@ DAVIS
 *.mp4
 **/**/.DS_Store
 wandb
-checkpoints
+# checkpoints
 ipynb_checkpoints
 **/**/.ipynb_checkpoints
 notebooks
