@@ -1,6 +1,6 @@
 # Latent Action Learning Requires Supervision in the Presence of Distractors
 
-[[Project]](https://laom.github.io/)
+[[Project]](https://laom.dunnolab.ai/)
 [[Paper]](https://arxiv.org/abs/2502.00379)
 [[Twitter]]()
 
