@@ -2,7 +2,7 @@
 
 [[Project]](https://laom.dunnolab.ai/)
 [[Paper]](https://arxiv.org/abs/2502.00379)
-[[Twitter]]()
+[[Twitter]](https://x.com/how_uhh/status/1927487077345841576)
 
 Official implementation of the [**Latent Action Learning Requires Supervision in the Presence of Distractors**](https://arxiv.org/abs/2502.00379). Through empirical investigation, we demonstrate that supervision is necessary for good performance in latent action learning, highlighting a major limitation of current methods.
 
