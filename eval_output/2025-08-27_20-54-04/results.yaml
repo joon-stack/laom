@@ -1,0 +1,31 @@
+mean_return: !!python/object/apply:numpy.core.multiarray.scalar
+- &id001 !!python/object/apply:numpy.dtype
+  args:
+  - f8
+  - false
+  - true
+  state: !!python/tuple
+  - 3
+  - <
+  - null
+  - null
+  - null
+  - -1
+  - -1
+  - 0
+- !!binary |
+  AADQYb+jEUA=
+returns:
+- 22.034963607788086
+- 0.0
+- 0.0
+- 0.0
+- 0.014585153199732304
+std_return: !!python/object/apply:numpy.core.multiarray.scalar
+- *id001
+- !!binary |
+  +YJLxAOgIUA=
+success_rate: !!python/object/apply:numpy.core.multiarray.scalar
+- *id001
+- !!binary |
+  AAAAAAAAAAA=

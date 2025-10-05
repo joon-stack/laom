@@ -170,3 +170,8 @@ ipynb_checkpoints
 **/**/.ipynb_checkpoints
 notebooks
 .ruff_cache
+
+*.out
+*.err
+*.png
+*.sh

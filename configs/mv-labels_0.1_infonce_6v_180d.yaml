@@ -1,0 +1,109 @@
+group: "mv-labels-default"
+seed: 0
+debug_dataloader: true
+
+lapo:
+  num_epochs: 100
+  batch_size: 64
+  labeled_batch_size: 16
+  camera_num: 6
+  view_keys: [0, 4, 8, 12, 16, 20]
+  eval_view_keys: [10]
+  views_per_instance: 4
+  contrastive_loss_coef: 0.1
+  triplet_warmup_epochs: 0
+  base_margin: 0.2
+  labeled_loss_coef: 0.0
+  cosine_loss: False
+  use_aug: True
+  future_obs_offset: 10
+  learning_rate: 0.0001
+  weight_decay: 0.0
+  warmup_epochs: 20
+  grad_norm: 1.0
+  latent_action_dim: 128
+  act_head_dim: 1024
+  act_head_dropout: 0.0
+  obs_head_dim: 1024
+  obs_head_dropout: 0.0
+  encoder_scale: 1
+  encoder_num_res_blocks: 2
+  encoder_dropout: 0.0
+  encoder_norm_out: False
+  encoder_deep: False
+  target_tau: 0.001
+  target_update_every: 1
+  frame_stack: 1
+  data_path: "data/example-data.hdf5"
+  eval_data_path: "data/example-data.hdf5"
+  labeled_data_path: "data/example-data.hdf5"
+  seed: 0
+  num_workers: 12
+  normalize_triplet: False
+  loss_type: "infonce"  # "triplet" or "infonce"
+  infonce_temperature: 0.1
+  # --- False Negative Filtering ---
+  filtering_type: "l2"  # "none", "dtw", or "l2"
+  dtw_threshold: 5.0
+  l2_threshold: 5.0
+  fixed_batch_offset: True
+  # TODO: change to your data and action-labeled data path, eval is optional
+  data_path: "data/example-data.hdf5"
+  labeled_data_path: "data/example-data.hdf5"
+  eval_data_path: "data/example-data.hdf5"
+    # --- Mixed View Sampling ---
+  mixed_view_sampling: false
+  positive_samples_per_instance: 8
+  # --- Image Resize ---
+  resize_size: 64
+
+bc:
+  num_epochs: 100
+  batch_size: 256
+  learning_rate: 0.00001
+  weight_decay: 0.0 
+  warmup_epochs: 0
+  encoder_scale: 32
+  encoder_num_res_blocks: 2
+  encoder_deep: False
+  dropout: 0.0
+  use_aug: False
+  frame_stack: 1
+  # TODO: change to your data and DAVIS path
+  data_path: "data/example-data.hdf5"
+  dcs_backgrounds_path: "DAVIS/JPEGImages/480p"
+  dcs_backgrounds_split: "train"
+  eval_episodes: 5
+  eval_seed: 0
+  # --- Image Resize ---
+  resize_size: 64
+
+  # Multi-view related settings
+  camera_num: 1
+  view_keys: [10]
+  views_per_instance: 1
+  fixed_offset: 10
+
+decoder:
+  total_updates: 2500
+  batch_size: 256
+  learning_rate: 0.0003
+  weight_decay: 0.0
+  warmup_epochs: 0
+  hidden_dim: 256
+  frame_stack: 1
+  use_aug: False
+  # TODO: change to your DAVIS path
+  dcs_backgrounds_path: "DAVIS/JPEGImages/480p"
+  dcs_backgrounds_split: "train"
+  eval_episodes: 25
+  eval_seed: 0
+
+  # Multi-view related settings
+  camera_num: 1
+  view_keys: [10]
+  views_per_instance: 1
+  fixed_offset: 10
+
+   # --- Image Resize ---
+  resize_size: 64

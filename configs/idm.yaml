@@ -2,8 +2,8 @@ group: "idm-default"
 seed: 0
 
 idm:
-  total_updates: 10000
-  batch_size: 512
+  total_updates: 240000
+  batch_size: 4
   use_aug: False
   future_obs_offset: 1
   learning_rate: 0.0001

@@ -1,9 +1,12 @@
 import math
+import os
 import time
 import uuid
 from copy import deepcopy
 from dataclasses import asdict, dataclass
+from datetime import datetime
 from typing import Optional
+import yaml
 
 import numpy as np
 import pyrallis
@@ -14,7 +17,7 @@ import torchinfo
 import wandb
 from pyrallis import field
 from torch.utils.data import DataLoader
-from tqdm import trange
+from tqdm import trange, tqdm
 
 from src.augmentations import Augmenter
 from src.nn import ActionDecoder, Actor, LAOMWithLabels
@@ -110,6 +113,8 @@ class Config:
     group: str = "laom-labels"
     name: str = "laom-labels"
     seed: int = 0
+    lapo_checkpoint_path: Optional[str] = None
+    bc_checkpoint_path: Optional[str] = None
 
     lapo: LAOMConfig = field(default_factory=LAOMConfig)
     bc: BCConfig = field(default_factory=BCConfig)
@@ -142,9 +147,9 @@ def evaluate(lam, dataloader, device):
     return total_loss / total_samples
 
 
-def train_laom(config: LAOMConfig):
+def train_laom(config: LAOMConfig, checkpoint_dir: str):
     dataset = DCSLAOMInMemoryDataset(
-        config.data_path, max_offset=config.future_obs_offset, frame_stack=config.frame_stack, device=DEVICE
+        config.data_path, max_offset=config.future_obs_offset, frame_stack=config.frame_stack, device="cpu"
     )
     dataloader = DataLoader(
         dataset,
@@ -155,13 +160,13 @@ def train_laom(config: LAOMConfig):
         config.labeled_data_path,
         max_offset=config.future_obs_offset,
         frame_stack=config.frame_stack,
-        device=DEVICE,
+        device="cpu",
     )
     labeled_dataloader = DataLoader(labeled_dataset, batch_size=config.labeled_batch_size)
 
     if config.eval_data_path is not None:
         eval_dataset = DCSLAOMInMemoryDataset(
-            config.eval_data_path, max_offset=1, frame_stack=config.frame_stack, device=DEVICE
+            config.eval_data_path, max_offset=1, frame_stack=config.frame_stack, device="cpu"
         )
         eval_dataloader = DataLoader(
             eval_dataset,
@@ -225,7 +230,7 @@ def train_laom(config: LAOMConfig):
     labeled_dataloader_iter = iter(labeled_dataloader)
     for epoch in trange(config.num_epochs, desc="Epochs"):
         lapo.train()
-        for i, batch in enumerate(dataloader):
+        for i, batch in tqdm(enumerate(dataloader), total=len(dataloader), desc=f"Epoch {epoch+1}/{config.num_epochs}", leave=False):
             total_tokens += config.batch_size
             total_iterations += 1
 
@@ -259,6 +264,7 @@ def train_laom(config: LAOMConfig):
                 else:
                     loss0 = F.mse_loss(latent_next_obs, next_obs_target.detach())
 
+            latent_action_std = torch.std(latent_action, dim=0).mean().item()
             # loss with true actions
             labeled_batch = next(labeled_dataloader_iter)
             label_obs, label_next_obs, label_future_obs, label_actions, _, _ = [b.to(DEVICE) for b in labeled_batch]
@@ -333,6 +339,7 @@ def train_laom(config: LAOMConfig):
                     "lapo/latent_act_norm": torch.norm(latent_action, p=2, dim=-1).mean().item(),
                     "lapo/epoch": epoch,
                     "lapo/total_steps": total_iterations,
+                    "lapo/latent_act_std": latent_action_std,
                 }
             )
 
@@ -345,8 +352,91 @@ def train_laom(config: LAOMConfig):
                     "lapo/total_steps": total_iterations,
                 }
             )
+        
+        
+        # # 매 epoch마다 체크포인트 저장
+        # save_checkpoint(
+        #     lapo,
+        #     optim,
+        #     scheduler,
+        #     epoch,
+        #     loss.item(),
+        #     os.path.join(checkpoint_dir, f"lapo_epoch_{epoch+1}.pt"),
+        #     config,
+        # )
+
+    # 최종 모델 저장
+    save_checkpoint(
+        lapo,
+        optim,
+        scheduler,
+        config.num_epochs - 1,
+        loss.item(),
+        os.path.join(checkpoint_dir, "lapo_final.pt"),
+        config,
+    )
 
     return lapo
+
+
+def save_checkpoint(model, optimizer, scheduler, epoch, loss, filepath, config=None):
+    """모델 체크포인트를 저장합니다."""
+    checkpoint_data = {
+        'epoch': epoch,
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
+        'loss': loss,
+    }
+    
+    # config 정보가 있으면 별도 yaml 파일로 저장
+    if config is not None:
+        config_filepath = filepath.replace('.pt', '_config.yaml')
+        with open(config_filepath, 'w') as f:
+            yaml.dump(asdict(config), f, default_flow_style=False, allow_unicode=True)
+        print(f"Config 저장됨: {config_filepath}")
+    
+    torch.save(checkpoint_data, filepath)
+    print(f"체크포인트 저장됨: {filepath}")
+
+
+def load_checkpoint(model, optimizer, scheduler, filepath):
+    """모델 체크포인트를 불러옵니다."""
+    if os.path.exists(filepath):
+        checkpoint = torch.load(filepath, map_location=DEVICE)
+        
+        # Debugging: print shapes before loading
+        if 'model_state_dict' in checkpoint and hasattr(model, 'true_actions_head'):
+            print("--- Shape Debug ---")
+            # Shape in the current model
+            current_shape = model.true_actions_head.weight.shape
+            print(f"Current model's 'true_actions_head' shape: {current_shape}")
+            
+            # Shape in the checkpoint
+            checkpoint_shape = checkpoint['model_state_dict']['true_actions_head.weight'].shape
+            print(f"Checkpoint's 'true_actions_head' shape: {checkpoint_shape}")
+            print("-------------------")
+
+        model.load_state_dict(checkpoint['model_state_dict'])
+        if optimizer and 'optimizer_state_dict' in checkpoint and checkpoint['optimizer_state_dict']:
+            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        if scheduler and 'scheduler_state_dict' in checkpoint and checkpoint['scheduler_state_dict']:
+            scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        print(f"체크포인트 불러옴: {filepath} (epoch {checkpoint['epoch']})")
+        
+        # config yaml 파일이 있으면 불러와서 출력
+        config_filepath = filepath.replace('.pt', '_config.yaml')
+        if os.path.exists(config_filepath):
+            with open(config_filepath, 'r') as f:
+                config = yaml.safe_load(f)
+            print(f"Config 파일 불러옴: {config_filepath}")
+            print("체크포인트에 저장된 config 정보:")
+            for key, value in config.items():
+                print(f"  {key}: {value}")
+            return checkpoint['epoch'], checkpoint['loss'], config
+        
+        return checkpoint['epoch'], checkpoint['loss'], None
+    return 0, float('inf'), None
 
 
 @torch.no_grad()
@@ -374,8 +464,8 @@ def evaluate_bc(env, actor, num_episodes, seed=0, device="cpu", action_decoder=N
     return np.array(returns)
 
 
-def train_bc(lam: LAOMWithLabels, config: BCConfig):
-    dataset = DCSInMemoryDataset(config.data_path, frame_stack=config.frame_stack, device=DEVICE)
+def train_bc(lam: LAOMWithLabels, config: BCConfig, checkpoint_dir: str):
+    dataset = DCSInMemoryDataset(config.data_path, frame_stack=config.frame_stack, device="cpu")
     dataloader = DataLoader(
         dataset,
         batch_size=config.batch_size,
@@ -429,7 +519,7 @@ def train_bc(lam: LAOMWithLabels, config: BCConfig):
     total_steps = 0
     for epoch in trange(config.num_epochs, desc="Epochs"):
         actor.train()
-        for batch in dataloader:
+        for batch in tqdm(dataloader, desc=f"Epoch {epoch+1}/{config.num_epochs}", leave=False):
             total_tokens += config.batch_size
             total_steps += 1
 
@@ -475,6 +565,28 @@ def train_bc(lam: LAOMWithLabels, config: BCConfig):
                     "bc/total_steps": total_steps,
                 }
             )
+        
+        # 매 epoch마다 체크포인트 저장
+        # save_checkpoint(
+        #     actor,
+        #     optim,
+        #     scheduler,
+        #     epoch,
+        #     loss.item(),
+        #     os.path.join(checkpoint_dir, f"bc_epoch_{epoch+1}.pt"),
+        #     config,
+        # )
+
+    # 최종 모델 저장
+    save_checkpoint(
+        actor,
+        optim,
+        scheduler,
+        config.num_epochs - 1,
+        loss.item(),
+        os.path.join(checkpoint_dir, "bc_final.pt"),
+        config,
+    )
 
     actor.eval()
     eval_returns = evaluate_bc(
@@ -497,12 +609,12 @@ def train_bc(lam: LAOMWithLabels, config: BCConfig):
     return actor
 
 
-def train_act_decoder(actor: Actor, config: DecoderConfig, bc_config: BCConfig):
+def train_act_decoder(actor: Actor, config: DecoderConfig, bc_config: BCConfig, checkpoint_dir: str):
     for p in actor.parameters():
         p.requires_grad_(False)
     actor.eval()
 
-    dataset = DCSInMemoryDataset(config.data_path, frame_stack=bc_config.frame_stack, device=DEVICE)
+    dataset = DCSInMemoryDataset(config.data_path, frame_stack=bc_config.frame_stack, device="cpu")
     dataloader = DataLoader(
         dataset,
         batch_size=config.batch_size,
@@ -543,7 +655,7 @@ def train_act_decoder(actor: Actor, config: DecoderConfig, bc_config: BCConfig):
     total_steps = 0
 
     for epoch in trange(num_epochs, desc="Epochs"):
-        for batch in dataloader:
+        for batch in tqdm(dataloader, desc=f"Epoch {epoch+1}/{num_epochs}", leave=False):
             total_tokens += config.batch_size
             total_steps += 1
 
@@ -576,6 +688,28 @@ def train_act_decoder(actor: Actor, config: DecoderConfig, bc_config: BCConfig):
                     "decoder/total_steps": total_steps,
                 }
             )
+        
+        # # 매 epoch마다 체크포인트 저장
+        # save_checkpoint(
+        #     action_decoder,
+        #     optim,
+        #     scheduler,
+        #     epoch,
+        #     loss.item(),
+        #     os.path.join(checkpoint_dir, f"action_decoder_epoch_{epoch+1}.pt"),
+        #     config,
+        # )
+
+    # 최종 모델 저장
+    save_checkpoint(
+        action_decoder,
+        optim,
+        scheduler,
+        num_epochs - 1,
+        loss.item(),
+        os.path.join(checkpoint_dir, "action_decoder_final.pt"),
+        config,
+    )
 
     actor.eval()
     eval_returns = evaluate_bc(
@@ -608,12 +742,70 @@ def train(config: Config):
         save_code=True,
     )
     set_seed(config.seed)
+
+    # 체크포인트 디렉토리 설정
+    base_checkpoint_dir = "/shared/s2/lab01/youngjoonjeong/LAOM/checkpoints"
+    if config.lapo_checkpoint_path:
+        checkpoint_dir = os.path.dirname(config.lapo_checkpoint_path)
+    elif config.bc_checkpoint_path:
+        checkpoint_dir = os.path.dirname(config.bc_checkpoint_path)
+    else:
+        timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        checkpoint_dir = os.path.join(base_checkpoint_dir, timestamp)
+
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    print(f"Checkpoint directory: {checkpoint_dir}")
+
     # stage 1: pretraining lapo on unlabeled dataset
-    lapo = train_laom(config=config.lapo)
+    if config.lapo_checkpoint_path:
+        print("=== Stage 1: LAPO Pretraining (skipped, loading from checkpoint) ===")
+        # To create model, we need dataset metadata
+        dataset = DCSLAOMInMemoryDataset(
+            config.lapo.data_path,
+            max_offset=config.lapo.future_obs_offset,
+            frame_stack=config.lapo.frame_stack,
+            device="cpu",
+        )
+        lapo = LAOMWithLabels(
+            shape=(3 * config.lapo.frame_stack, dataset.img_hw, dataset.img_hw),
+            true_act_dim=dataset.act_dim,
+            latent_act_dim=config.lapo.latent_action_dim,
+            act_head_dim=config.lapo.act_head_dim,
+            act_head_dropout=config.lapo.act_head_dropout,
+            obs_head_dim=config.lapo.obs_head_dim,
+            obs_head_dropout=config.lapo.obs_head_dropout,
+            encoder_scale=config.lapo.encoder_scale,
+            encoder_channels=(16, 32, 64, 128, 256) if config.lapo.encoder_deep else (16, 32, 32),
+            encoder_num_res_blocks=config.lapo.encoder_num_res_blocks,
+            encoder_dropout=config.lapo.encoder_dropout,
+            encoder_norm_out=config.lapo.encoder_norm_out,
+        ).to(DEVICE)
+        load_checkpoint(lapo, None, None, config.lapo_checkpoint_path)
+    else:
+        print("=== Stage 1: LAPO Pretraining ===")
+        lapo = train_laom(config=config.lapo, checkpoint_dir=checkpoint_dir)
+    
     # stage 2: pretraining bc on latent actions
-    actor = train_bc(lam=lapo, config=config.bc)
-    # stage 3: finetune on labeles ground-truth actions
-    action_decoder = train_act_decoder(actor=actor, config=config.decoder, bc_config=config.bc)
+    if config.bc_checkpoint_path:
+        print("=== Stage 2: BC Pretraining (skipped, loading from checkpoint) ===")
+        # We need dataset metadata to create the actor model
+        dataset = DCSInMemoryDataset(config.bc.data_path, frame_stack=config.bc.frame_stack, device="cpu")
+        actor = Actor(
+            shape=(3 * config.bc.frame_stack, dataset.img_hw, dataset.img_hw),
+            num_actions=config.lapo.latent_action_dim,
+            encoder_scale=config.bc.encoder_scale,
+            encoder_channels=(16, 32, 64, 128, 256) if config.bc.encoder_deep else (16, 32, 32),
+            encoder_num_res_blocks=config.bc.encoder_num_res_blocks,
+            dropout=config.bc.dropout,
+        ).to(DEVICE)
+        load_checkpoint(actor, None, None, config.bc_checkpoint_path)
+    else:
+        print("=== Stage 2: BC Pretraining ===")
+        actor = train_bc(lam=lapo, config=config.bc, checkpoint_dir=checkpoint_dir)
+    
+    # stage 3: finetune on labeled ground-truth actions
+    print("=== Stage 3: Action Decoder Finetuning ===")
+    action_decoder = train_act_decoder(actor=actor, config=config.decoder, bc_config=config.bc, checkpoint_dir=checkpoint_dir)
 
     run.finish()
     return lapo, actor, action_decoder

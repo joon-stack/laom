@@ -1,6 +1,7 @@
 import torch
 import torch.nn.functional as F
 import torchvision.transforms as TF
+import random
 
 
 class RandomShiftAug:
@@ -53,6 +54,68 @@ class RandomPerspectiveAug:
         return x
 
 
+class ColorJitterAug:
+    def __init__(self, brightness=0.8, contrast=0.8, saturation=0.8, hue=0.2):
+        self.brightness = brightness
+        self.contrast = contrast
+        self.saturation = saturation
+        self.hue = hue
+
+    def __call__(self, x):
+        return TF.functional.adjust_brightness(
+            TF.functional.adjust_contrast(
+                TF.functional.adjust_saturation(
+                    TF.functional.adjust_hue(x, random.uniform(-self.hue, self.hue)),
+                    random.uniform(1-self.saturation, 1+self.saturation)
+                ),
+                random.uniform(1-self.contrast, 1+self.contrast)
+            ),
+            random.uniform(1-self.brightness, 1+self.brightness)
+        )
+
+
+class RandomGrayscaleAug:
+    def __init__(self, p=0.5):
+        self.p = p
+
+    def __call__(self, x):
+        if random.random() < self.p:
+            return TF.functional.rgb_to_grayscale(x, num_output_channels=3)
+        return x
+
+
+class GaussianBlurAug:
+    def __init__(self, kernel_size=23, sigma=(0.1, 2.0)):
+        self.kernel_size = kernel_size
+        self.sigma = sigma
+
+    def __call__(self, x):
+        sigma = random.uniform(self.sigma[0], self.sigma[1])
+        return TF.functional.gaussian_blur(x, kernel_size=self.kernel_size, sigma=sigma)
+
+
+class RandomResizedCropAug:
+    def __init__(self, size, scale=(0.08, 1.0), ratio=(3./4., 4./3.)):
+        self.size = size
+        self.scale = scale
+        self.ratio = ratio
+
+    def __call__(self, x):
+        n, c, h, w = x.shape
+        # RandomResizedCrop for each image in batch
+        result = torch.zeros_like(x)
+        for i in range(n):
+            result[i] = TF.functional.resized_crop(
+                x[i:i+1], 
+                top=random.randint(0, max(1, h - int(h * self.scale[1]))),
+                left=random.randint(0, max(1, w - int(w * self.scale[1]))),
+                height=random.randint(int(h * self.scale[0]), int(h * self.scale[1])),
+                width=random.randint(int(w * self.scale[0]), int(w * self.scale[1])),
+                size=(h, w)
+            ).squeeze(0)
+        return result
+
+
 class ComposeAugs:
     def __init__(self, augs):
         self.augs = augs
@@ -75,6 +138,10 @@ def get_aug(aug_choice, img_resolution):
         "rotate": RandomRotateAug(rotate_pad, degrees=90),
         "shift": RandomShiftAug(shift_pad),
         "perspective": RandomPerspectiveAug(),
+        "colorjitter": ColorJitterAug(brightness=0.8, contrast=0.8, saturation=0.8, hue=0.2),
+        "grayscale": RandomGrayscaleAug(p=0.5),
+        "blur": GaussianBlurAug(kernel_size=23, sigma=(0.1, 2.0)),
+        "resizedcrop": RandomResizedCropAug(size=img_resolution, scale=(0.08, 1.0), ratio=(3./4., 4./3.)),
         "nothing": lambda x: x,
     }
     composed_aug = ComposeAugs(augs=[augs[aug] for aug in aug_choice.split("-")])
@@ -83,8 +150,9 @@ def get_aug(aug_choice, img_resolution):
 
 class Augmenter:
     def __init__(self, img_resolution):
-        # yes, this is not optimal way of doing this...
+        # Enhanced augmentation set with new color and geometric augmentations
         self.augs = [
+            # Original geometric augmentations
             get_aug("nothing", img_resolution),
             get_aug("shift", img_resolution),
             get_aug("rotate", img_resolution),
@@ -93,6 +161,27 @@ class Augmenter:
             get_aug("rotate-shift", img_resolution),
             get_aug("rotate-perspective", img_resolution),
             get_aug("perspective-rotate", img_resolution),
+            
+            # # New color augmentations
+            # get_aug("colorjitter", img_resolution),
+            # get_aug("grayscale", img_resolution),
+            # get_aug("blur", img_resolution),
+            # get_aug("resizedcrop", img_resolution),
+            
+            # # Color + Geometric combinations
+            # get_aug("colorjitter-shift", img_resolution),
+            # get_aug("colorjitter-rotate", img_resolution),
+            # get_aug("grayscale-shift", img_resolution),
+            # get_aug("grayscale-rotate", img_resolution),
+            # get_aug("blur-shift", img_resolution),
+            # get_aug("blur-rotate", img_resolution),
+            # get_aug("resizedcrop-colorjitter", img_resolution),
+            # get_aug("resizedcrop-grayscale", img_resolution),
+            
+            # # Triple combinations
+            # get_aug("colorjitter-shift-rotate", img_resolution),
+            # get_aug("grayscale-shift-rotate", img_resolution),
+            # get_aug("blur-shift-rotate", img_resolution),
         ]
         self.num_augs = len(self.augs)
 

@@ -1,4 +1,5 @@
 import math
+import os
 
 import torch
 import torch.nn as nn
@@ -25,11 +26,28 @@ class MLPBlock(nn.Module):
 class LatentActHead(nn.Module):
     def __init__(self, act_dim, emb_dim, hidden_dim, expand=4, dropout=0.0):
         super().__init__()
-        self.proj0 = nn.Linear(2 * emb_dim, hidden_dim)
-        self.proj1 = nn.Linear(hidden_dim + 2 * emb_dim, hidden_dim)
-        self.proj2 = nn.Linear(hidden_dim + 2 * emb_dim, hidden_dim)
+        #TODO : modify 
+        # self.proj0 = nn.Linear(2 * emb_dim, hidden_dim)
+        # self.proj1 = nn.Linear(hidden_dim + 2 * emb_dim, hidden_dim)
+        # self.proj2 = nn.Linear(hidden_dim + 2 * emb_dim, hidden_dim)
+        # self.proj_end = nn.Linear(hidden_dim, act_dim)
+        self.proj0 = nn.Sequential(
+            nn.Linear(2 * emb_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU()
+        )
+        self.proj1 = nn.Sequential(
+            nn.Linear(hidden_dim + 2 * emb_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU()
+        )
+        self.proj2 = nn.Sequential(
+            nn.Linear(hidden_dim + 2 * emb_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU()
+        )
         self.proj_end = nn.Linear(hidden_dim, act_dim)
-
+        
         self.block0 = MLPBlock(hidden_dim, expand, dropout)
         self.block1 = MLPBlock(hidden_dim, expand, dropout)
         self.block2 = MLPBlock(hidden_dim, expand, dropout)
@@ -575,3 +593,432 @@ class IDMLabels(nn.Module):
         obs_emb, next_obs_emb = self.encoder(torch.concat([obs, next_obs])).split(obs.shape[0])
         pred_action = self.idm_head(obs_emb.flatten(1), next_obs_emb.flatten(1))
         return pred_action
+
+class MVWithLabels(nn.Module):
+    def __init__(
+        self,
+        shape,
+        true_act_dim,
+        latent_act_dim,
+        encoder_scale=1,
+        encoder_channels=(16, 32, 64, 128, 256),
+        encoder_num_res_blocks=1,
+        encoder_dropout=0.0,
+        encoder_norm_out=True,
+        act_head_dim=512,
+        act_head_dropout=0.0,
+        obs_head_dim=512,
+        obs_head_dropout=0.0,
+    ):
+        super().__init__()
+        self.inital_shape = shape
+
+        # encoder
+        conv_stack = []
+        for out_ch in encoder_channels:
+            conv_seq = EncoderBlock(shape, encoder_scale * out_ch, encoder_num_res_blocks, encoder_dropout)
+            shape = conv_seq.get_output_shape()
+            conv_stack.append(conv_seq)
+
+        self.encoder = nn.Sequential(
+            *conv_stack,
+            nn.Flatten(),
+            nn.LayerNorm(math.prod(shape), elementwise_affine=False) if encoder_norm_out else nn.Identity(),
+        )
+        self.idm_head = LatentActHead(latent_act_dim, math.prod(shape), act_head_dim, dropout=act_head_dropout)
+        self.true_actions_head = nn.Linear(latent_act_dim, true_act_dim)
+
+        self.fdm_head = LatentObsHead(latent_act_dim, math.prod(shape), obs_head_dim, dropout=obs_head_dropout)
+        self.final_encoder_shape = shape
+        self.latent_act_dim = latent_act_dim
+        self.apply(weight_init)
+
+    def forward(self, obs, next_obs, predict_true_act=False):
+        # for faster forwad + unified batch norm stats, WARN: 2x batch size!
+        obs_emb, next_obs_emb = self.encoder(torch.concat([obs, next_obs])).split(obs.shape[0])
+
+        latent_action = self.idm_head(obs_emb.flatten(1), next_obs_emb.flatten(1))
+        latent_next_obs = self.fdm_head(obs_emb.flatten(1).detach(), latent_action)
+        # TODO: use norm from encoder here too!
+
+        if predict_true_act:
+            true_action = self.true_actions_head(latent_action)
+            return latent_next_obs, latent_action, true_action, obs_emb.flatten(1).detach()
+
+        return latent_next_obs, latent_action, obs_emb.flatten(1).detach()
+
+    @torch.no_grad()
+    def label(self, obs, next_obs):
+        # for faster forwad + unified batch norm stats, WARN: 2x batch size!
+        obs_emb, next_obs_emb = self.encoder(torch.concat([obs, next_obs])).split(obs.shape[0])
+        latent_action = self.idm_head(obs_emb.flatten(1), next_obs_emb.flatten(1))
+        return latent_action
+
+
+# ==================== Disentanglement Loss Functions ====================
+
+def compute_infonce_loss(embeddings_list, ids, temperature=0.07, loss_name=""):
+    """
+    InfoNCE contrastive loss for disentanglement.
+    
+    Args:
+        embeddings_list: List of embedding tensors, each [B, D]
+        ids: [B] - IDs for positive pair grouping (same ID = positive)
+        temperature: Temperature parameter for InfoNCE
+        loss_name: Name for debugging prints.
+    
+    Returns:
+        InfoNCE loss scalar
+    """
+    # Concat all embeddings: [N, D] where N = len(embeddings_list) * B
+    all_embeddings = torch.cat(embeddings_list, dim=0)  # [N, D]
+    N = all_embeddings.shape[0]
+    
+    # Expand ids for all embeddings
+    all_ids = ids.repeat(len(embeddings_list))  # [N]
+    
+    # Compute similarity matrix: [N, N]
+    all_embeddings_norm = torch.nn.functional.normalize(all_embeddings, dim=-1)
+    similarity_matrix = torch.matmul(all_embeddings_norm, all_embeddings_norm.T) / temperature
+    
+    # Create positive mask: same id
+    positive_mask = (all_ids.unsqueeze(0) == all_ids.unsqueeze(1)).float()  # [N, N]
+
+    # --- DEBUG PRINTS ---
+    if "DEBUG_CONTRASTIVE" in os.environ and os.environ["DEBUG_CONTRASTIVE"] == "1":
+        print(f"\n--- Contrastive Loss Debug ({loss_name}) ---")
+        print(f"Batch size (N): {N}")
+        print(f"First 16 IDs used for grouping: {all_ids[:16].cpu().numpy()}")
+        
+        # Show positive mask for a small part of the batch
+        print_size = min(N, 16)
+        print(f"Positive Mask (based on IDs, first {print_size}x{print_size}):\n{positive_mask[:print_size, :print_size].cpu().numpy()}")
+        
+        # Example for the first sample
+        anchor_positives_before_self = torch.where(positive_mask[0] == 1)[0]
+        print(f"Anchor 0 (ID: {all_ids[0]}) is positive with (including self): {anchor_positives_before_self.cpu().numpy()}")
+        
+        negatives = torch.where(positive_mask[0] == 0)[0]
+        print(f"Anchor 0 is negative with {len(negatives)} samples.")
+        print("----------------------------\n")
+    # --- END DEBUG PRINTS ---
+    
+    # Remove self-similarity (diagonal)
+    positive_mask = positive_mask * (1 - torch.eye(N, device=positive_mask.device))
+    
+    # Check if there are any positives
+    num_positives = positive_mask.sum(dim=1)
+    if num_positives.max() == 0:
+        return torch.tensor(0.0, device=all_embeddings.device)
+    
+    # Compute InfoNCE loss
+    exp_sim = torch.exp(similarity_matrix)
+    
+    # Sum of positive similarities
+    pos_sim = (exp_sim * positive_mask).sum(dim=1)
+    
+    # Sum of all similarities (exclude self)
+    all_sim = exp_sim.sum(dim=1) - torch.diag(exp_sim)
+    
+    # Loss: -log(pos_sim / all_sim)
+    # Only compute for samples that have positives
+    valid_mask = num_positives > 0
+    if valid_mask.sum() == 0:
+        return torch.tensor(0.0, device=all_embeddings.device)
+    
+    loss = -torch.log((pos_sim[valid_mask] / (all_sim[valid_mask] + 1e-8)) + 1e-8).mean()
+    
+    return loss
+
+
+def compute_action_contrastive_loss(z_a_list, instance_ids, temperature=0.07):
+    """
+    Contrastive loss for action encoder.
+    z_a from same instance_id should be similar (positive pairs).
+    
+    Args:
+        z_a_list: List of [B, D] action embeddings from different view pairs
+        instance_ids: [B] instance identifiers
+        temperature: Temperature for InfoNCE
+    
+    Returns:
+        Action contrastive loss
+    """
+    return compute_infonce_loss(z_a_list, instance_ids, temperature, loss_name="Action (group by instance_id)")
+
+
+def compute_view_contrastive_loss(z_v_list, view_pair_ids, instance_ids, temperature=0.07):
+    """
+    Contrastive loss for view encoder.
+    z_v from same view_pair_id (but different instance) should be similar.
+    
+    Args:
+        z_v_list: List of [B, D] view embeddings
+        view_pair_ids: [B] view pair identifiers
+        instance_ids: [B] instance identifiers (used to exclude same instance)
+        temperature: Temperature for InfoNCE
+    
+    Returns:
+        View contrastive loss
+    """
+    # Use view_pair_ids as the grouping criterion
+    # But we need to handle the case where same instance should not be positive
+    # For simplicity, use view_pair_ids directly
+    return compute_infonce_loss(z_v_list, view_pair_ids, temperature, loss_name="View (group by view_pair_id)")
+
+
+def compute_zero_regularization(z, eps=1e-6):
+    """
+    L2 regularization to push embeddings toward zero.
+    
+    Args:
+        z: [B, D] embeddings
+        eps: Small constant for numerical stability
+    
+    Returns:
+        L2 norm squared
+    """
+    return torch.mean(torch.sum(z ** 2, dim=-1))
+
+
+def compute_reconstruction_loss(pred_emb_list, target_emb_list):
+    """
+    MSE reconstruction loss between predicted and target embeddings.
+    
+    Args:
+        pred_emb_list: List of predicted embeddings [B, D]
+        target_emb_list: List of target embeddings [B, D]
+    
+    Returns:
+        MSE loss
+    """
+    total_loss = 0.0
+    for pred, target in zip(pred_emb_list, target_emb_list):
+        total_loss += torch.nn.functional.mse_loss(pred, target)
+    return total_loss / len(pred_emb_list)
+
+
+class DisentangledLAOM(nn.Module):
+    """
+    Disentangled representation learning model with shared encoder and specialized heads.
+    
+    Architecture:
+    - Shared encoder: obs -> embedding
+    - IDM Action: (obs1, obs2) -> z_a (action representation)
+    - IDM View: (obs1, obs2) -> z_v (view representation)  
+    - FDM: (obs, z_a, z_v) -> obs_pred (reconstruction)
+    """
+    def __init__(
+        self,
+        shape,
+        latent_act_dim,
+        latent_view_dim,
+        encoder_scale=1,
+        encoder_channels=(16, 32, 64, 128, 256),
+        encoder_num_res_blocks=1,
+        encoder_dropout=0.0,
+        encoder_norm_out=True,
+        act_head_dim=512,
+        act_head_dropout=0.0,
+        obs_head_dim=512,
+        obs_head_dropout=0.0,
+        separate_fdm_heads=False,
+    ):
+        super().__init__()
+        self.initial_shape = shape
+        self.latent_act_dim = latent_act_dim
+        self.latent_view_dim = latent_view_dim
+        self.separate_fdm_heads = separate_fdm_heads
+        
+        # Build shared encoder
+        conv_stack = []
+        for out_ch in encoder_channels:
+            conv_seq = EncoderBlock(shape, encoder_scale * out_ch, encoder_num_res_blocks, encoder_dropout)
+            shape = conv_seq.get_output_shape()
+            conv_stack.append(conv_seq)
+        
+        self.shared_encoder = nn.Sequential(
+            *conv_stack,
+            nn.Flatten(),
+            nn.LayerNorm(math.prod(shape), elementwise_affine=False) if encoder_norm_out else nn.Identity(),
+        )
+        
+        # Specialized heads
+        emb_dim = math.prod(shape)
+        self.idm_action = LatentActHead(latent_act_dim, emb_dim, act_head_dim, dropout=act_head_dropout)
+        self.idm_view = LatentActHead(latent_view_dim, emb_dim, act_head_dim, dropout=act_head_dropout)
+        
+        # FDM heads: either one combined or two separate
+        if separate_fdm_heads:
+            self.fdm_head_action = LatentObsHead(latent_act_dim, emb_dim, obs_head_dim, dropout=obs_head_dropout)
+            self.fdm_head_view = LatentObsHead(latent_view_dim, emb_dim, obs_head_dim, dropout=obs_head_dropout)
+        else:
+            self.fdm_head = LatentObsHead(latent_act_dim + latent_view_dim, emb_dim, obs_head_dim, dropout=obs_head_dropout)
+        
+        self.final_encoder_shape = shape
+        self.apply(weight_init)
+    
+    def forward(self, obs1, obs2):
+        """
+        Forward pass for disentangled representation learning.
+        
+        Args:
+            obs1: First observation [B, C, H, W]
+            obs2: Second observation [B, C, H, W]
+            
+        Returns:
+            z_a: Action representation [B, latent_act_dim]
+            z_v: View representation [B, latent_view_dim]
+            obs_pred: Reconstructed observation [B, emb_dim]
+            obs1_emb: First observation embedding [B, emb_dim]
+        """
+        # Shared encoding (faster forward + unified batch norm stats)
+        obs1_emb, obs2_emb = self.shared_encoder(torch.concat([obs1, obs2])).split(obs1.shape[0])
+        obs1_emb = obs1_emb.flatten(1)
+        obs2_emb = obs2_emb.flatten(1)
+        
+        # Disentangled predictions
+        z_a = self.idm_action(obs1_emb, obs2_emb)  # Action representation
+        z_v = self.idm_view(obs1_emb, obs2_emb)    # View representation
+        
+        # Reconstruction (optional, for reconstruction loss)
+        if self.separate_fdm_heads:
+            # Use separate heads for action and view reconstruction
+            obs_pred_action = self.fdm_head_action(obs1_emb, z_a)
+            obs_pred_view = self.fdm_head_view(obs1_emb, z_v)
+            obs_pred = torch.concat([obs_pred_action, obs_pred_view], dim=-1)
+        else:
+            # Use combined head for reconstruction
+            z_combined = torch.concat([z_a, z_v], dim=-1)
+            obs_pred = self.fdm_head(obs1_emb, z_combined)
+        
+        return z_a, z_v, obs_pred, obs1_emb.detach()
+    
+    @torch.no_grad()
+    def encode(self, obs):
+        """Encode observation to embedding."""
+        return self.shared_encoder(obs).flatten(1)
+    
+    @torch.no_grad()
+    def predict_action(self, obs1, obs2):
+        """Predict action representation only."""
+        obs1_emb, obs2_emb = self.shared_encoder(torch.concat([obs1, obs2])).split(obs1.shape[0])
+        return self.idm_action(obs1_emb.flatten(1), obs2_emb.flatten(1))
+    
+    @torch.no_grad()
+    def predict_view(self, obs1, obs2):
+        """Predict view representation only."""
+        obs1_emb, obs2_emb = self.shared_encoder(torch.concat([obs1, obs2])).split(obs1.shape[0])
+        return self.idm_view(obs1_emb.flatten(1), obs2_emb.flatten(1))
+
+
+class IDMActionOnly(nn.Module):
+    """
+    Action-only IDM model for BC training.
+    
+    Architecture:
+    - Encoder: obs -> embedding
+    - IDM Action: (obs1, obs2) -> z_a (action representation)
+    - Action Head: z_a -> true_action (optional, for BC)
+    """
+    def __init__(
+        self,
+        shape,
+        latent_act_dim,
+        true_act_dim=None,
+        encoder_scale=1,
+        encoder_channels=(16, 32, 64, 128, 256),
+        encoder_num_res_blocks=1,
+        encoder_dropout=0.0,
+        encoder_norm_out=True,
+        act_head_dim=512,
+        act_head_dropout=0.0,
+    ):
+        super().__init__()
+        self.initial_shape = shape
+        self.latent_act_dim = latent_act_dim
+        
+        # Build encoder
+        conv_stack = []
+        for out_ch in encoder_channels:
+            conv_seq = EncoderBlock(shape, encoder_scale * out_ch, encoder_num_res_blocks, encoder_dropout)
+            shape = conv_seq.get_output_shape()
+            conv_stack.append(conv_seq)
+        
+        self.encoder = nn.Sequential(
+            *conv_stack,
+            nn.Flatten(),
+            nn.LayerNorm(math.prod(shape), elementwise_affine=False) if encoder_norm_out else nn.Identity(),
+        )
+        
+        # Action prediction head
+        emb_dim = math.prod(shape)
+        self.idm_head = LatentActHead(latent_act_dim, emb_dim, act_head_dim, dropout=act_head_dropout)
+        
+        # Optional: true action prediction head (for BC training)
+        if true_act_dim is not None:
+            self.action_head = nn.Linear(latent_act_dim, true_act_dim)
+        else:
+            self.action_head = None
+        
+        self.final_encoder_shape = shape
+        self.apply(weight_init)
+    
+    def forward(self, obs1, obs2, predict_true_act=False):
+        """
+        Forward pass for action prediction.
+        
+        Args:
+            obs1: First observation [B, C, H, W]
+            obs2: Second observation [B, C, H, W]
+            predict_true_act: Whether to predict true action
+            
+        Returns:
+            z_a: Action representation [B, latent_act_dim]
+            true_action: True action prediction [B, true_act_dim] (if predict_true_act=True)
+            obs1_emb: First observation embedding [B, emb_dim] (if predict_true_act=True)
+        """
+        # Encoding (faster forward + unified batch norm stats)
+        obs1_emb, obs2_emb = self.encoder(torch.concat([obs1, obs2])).split(obs1.shape[0])
+        obs1_emb = obs1_emb.flatten(1)
+        obs2_emb = obs2_emb.flatten(1)
+        
+        # Action prediction
+        z_a = self.idm_head(obs1_emb, obs2_emb)
+        
+        if predict_true_act and self.action_head is not None:
+            true_action = self.action_head(z_a)
+            return z_a, true_action, obs1_emb.detach()
+        
+        return z_a
+    
+    @torch.no_grad()
+    def encode(self, obs):
+        """Encode observation to embedding."""
+        return self.encoder(obs).flatten(1)
+    
+    @torch.no_grad()
+    def predict_action(self, obs1, obs2):
+        """Predict action representation only."""
+        obs1_emb, obs2_emb = self.encoder(torch.concat([obs1, obs2])).split(obs1.shape[0])
+        return self.idm_head(obs1_emb.flatten(1), obs2_emb.flatten(1))
+
+
+def copy_components(source_model, target_model):
+    """
+    Copy compatible components from DisentangledLAOM to IDMActionOnly.
+    
+    Args:
+        source_model: DisentangledLAOM instance
+        target_model: IDMActionOnly instance
+        
+    Returns:
+        target_model: Updated target model with copied weights
+    """
+    # Copy encoder weights
+    target_model.encoder.load_state_dict(source_model.shared_encoder.state_dict())
+    
+    # Copy IDM action head weights
+    target_model.idm_head.load_state_dict(source_model.idm_action.state_dict())
+    
+    return target_model
