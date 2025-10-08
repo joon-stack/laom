@@ -208,7 +208,7 @@ def visualize(args):
     
     # 출력 디렉토리 생성 (checkpoint 경로 기준)
     ckpt_dir = os.path.dirname(args.checkpoint_path)
-    output_dir = os.path.join(ckpt_dir, "umap_visualization")
+    output_dir = os.path.join(ckpt_dir, "umap_visualization_bc")
     os.makedirs(output_dir, exist_ok=True)
     
     # 파일명 생성
@@ -283,24 +283,25 @@ def visualize(args):
     markers_list = ['o', 's', 'D', '^', 'v', '<', '>', 'p', 'P', '*', 'h', 'H', 'X', '8']
     view_markers = {view: markers_list[i % len(markers_list)] for i, view in enumerate(unique_views)}
 
-    # 1. 모든 뷰와 액션 bin을 함께 시각화 (색상=액션, 모양=뷰)
+    # 1. 모든 뷰와 액션 bin을 함께 시각화 (색상=뷰만 표시)
     print("Generating combined plot for all views...")
     plt.figure(figsize=(16, 14))
+    
+    # 색상 팔레트를 view 기준으로 변경
+    view_palette = sns.color_palette("husl", n_colors=len(unique_views))
+    
     sns.scatterplot(
         data=df,
         x='umap1',
         y='umap2',
-        hue='action_bin',
-        style='view',
-        hue_order=unique_bins,
-        style_order=unique_views,
-        palette=action_palette,
-        markers=view_markers,
+        hue='view',
+        hue_order=unique_views,
+        palette=view_palette,
         s=80,
         alpha=0.7
     )
     
-    plt.title(f'UMAP: Color=Action Bin, Shape=View ({len(latent_actions)} samples from {num_traj_to_process} trajectories)')
+    plt.title(f'UMAP: Color=View ({len(latent_actions)} samples from {num_traj_to_process} trajectories)')
     plt.xlabel('UMAP Dimension 1')
     plt.ylabel('UMAP Dimension 2')
     plt.legend(title='Legend', bbox_to_anchor=(1.05, 1), loc='upper left', ncol=1)
@@ -361,8 +362,8 @@ if __name__ == "__main__":
     # parser.add_argument('--config-path', type=str, required=True,
     #                     help='Path to the config YAML file used for training.')
     
-    parser.add_argument('--output-prefix', type=str, default='umap_visualization', 
-                        help='Prefix for the output plot files (default: umap_visualization)')
+    parser.add_argument('--output-prefix', type=str, default='umap_visualization_bc', 
+                        help='Prefix for the output plot files (default: umap_visualization_bc)')
     parser.add_argument('--num-visualize', type=int, default=10000, 
                         help='Number of samples to visualize after loading all trajectories (default: 10000)')
     parser.add_argument('--future-offset', type=int, default=1, 

@@ -106,6 +106,7 @@ def visualize(args):
         'encoder_num_res_blocks': lapo_config['encoder_num_res_blocks'],
         'encoder_dropout': lapo_config.get('encoder_dropout', 0.0),
         'encoder_norm_out': lapo_config.get('encoder_norm_out', True),
+        'separate_fdm_heads': lapo_config.get('separate_fdm_heads', False),
     }
 
     lapo = DisentangledLAOM(**model_kwargs).to(DEVICE)

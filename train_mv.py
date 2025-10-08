@@ -454,6 +454,17 @@ class LAOMConfig:
     positive_samples_per_instance: int = 4  # Number of positive samples per instance when using mixed view sampling
     resize_size: int = 64  # Image resize size
 
+    # Camera conditioning (새로 추가)
+    use_camera_conditioning: bool = False
+    camera_embedding_dim: int = 64
+
+    # Self-Consistency Loss parameters
+    use_consistency_loss: bool = True  # Self-consistency loss 사용 여부
+    consistency_coef: float = 1.0  # Cycle consistency loss 가중치
+    log_consistency_details: bool = True  # 보조 손실들을 wandb에 로깅할지 여부
+    use_auxiliary_consistency_losses: bool = False  # cos_anti와 mag 손실을 loss에 포함할지 여부
+    auxiliary_consistency_coef: float = 0.5  # cos_anti와 mag 손실의 가중치
+
     train_dataset_size: Optional[int] = None
     val_dataset_size: Optional[int] = None
     unlabeled_train_dataset_size: Optional[int] = None
@@ -646,6 +657,13 @@ def train_mv(config: LAOMConfig, checkpoint_dir: str, config_path: str = None):
     set_seed(config.seed)
     DEVICE = config.device
 
+    # Camera conditioning 검증
+    if config.use_camera_conditioning and not config.mixed_view_sampling:
+        print("WARNING: use_camera_conditioning=True but mixed_view_sampling=False")
+        print("Camera conditioning is only meaningful with mixed_view_sampling=True")
+        print("Setting use_camera_conditioning=False")
+        config.use_camera_conditioning = False
+
     # --- Print view key configuration for debugging ---
     print("--- View Key Configuration ---")
     print(f"Training view_keys: {config.view_keys}")
@@ -783,6 +801,8 @@ def train_mv(config: LAOMConfig, checkpoint_dir: str, config_path: str = None):
         encoder_num_res_blocks=config.encoder_num_res_blocks,
         encoder_dropout=config.encoder_dropout,
         encoder_norm_out=config.encoder_norm_out,
+        num_cameras=len(config.view_keys) if config.use_camera_conditioning else 0,  # 새로 추가
+        camera_embedding_dim=config.camera_embedding_dim,  # 새로 추가
     ).to(DEVICE)
 
     target_lapo = deepcopy(lapo)
@@ -841,6 +861,11 @@ def train_mv(config: LAOMConfig, checkpoint_dir: str, config_path: str = None):
             obs, next_obs, future_obs, debug_actions, debug_action_sequences, debug_states, instance_ids, offsets, action_sequences_mask = [
                 batch[k].to(DEVICE) for k in ["obs", "next_obs", "future_obs", "actions", "action_sequences", "states", "instance_ids", "offsets", "action_sequences_mask"]
             ]
+
+            # Camera IDs (조건부 추가)
+            future_camera_ids = None
+            if config.use_camera_conditioning and "future_camera_ids" in batch:
+                future_camera_ids = batch["future_camera_ids"].to(DEVICE)
 
             # Debug: Print offsets for first batch to check if fixed_batch_offset=False works
             if epoch == 0 and i == 0:
@@ -902,15 +927,52 @@ def train_mv(config: LAOMConfig, checkpoint_dir: str, config_path: str = None):
 
             # update lapo
             with torch.autocast(DEVICE, dtype=torch.bfloat16):
-                latent_next_obs, latent_action, obs_hidden = lapo(obs_to_use, future_obs_to_use)
+                latent_next_obs, latent_action, obs_hidden = lapo(
+                    obs_to_use, 
+                    future_obs_to_use, 
+                    future_camera_ids=future_camera_ids  # 새로 추가 (None일 수도 있음)
+                )
 
                 with torch.no_grad():
-                    next_obs_target = target_lapo.encoder(next_obs_to_use).flatten(1)
+                    # 기존: next_obs_to_use 사용
+                    # 변경: future_obs_to_use 사용 (camera conditioning의 타겟)
+                    future_obs_target = target_lapo.encoder(future_obs_to_use).flatten(1)
 
                 if config.cosine_loss:
-                    loss0 = 1 - F.cosine_similarity(latent_next_obs, next_obs_target.detach(), dim=-1).mean()
+                    loss0 = 1 - F.cosine_similarity(latent_next_obs, future_obs_target.detach(), dim=-1).mean()
                 else:
-                    loss0 = F.mse_loss(latent_next_obs, next_obs_target.detach())
+                    loss0 = F.mse_loss(latent_next_obs, future_obs_target.detach())
+
+            # =================================================
+            # ===== Self-Consistency Loss 추가 부분 시작 ======
+            # =================================================
+            if config.use_consistency_loss:
+                with torch.autocast(DEVICE, dtype=torch.bfloat16):
+                    # 시간을 거꾸로 입력하여 backward latent action 계산
+                    _, latent_action_backward, _ = lapo(future_obs_to_use, obs_to_use, future_camera_ids=future_camera_ids)
+
+                    # 정방향과 역방향 action 벡터의 합이 0이 되도록 손실 계산
+                    loss_consistency = F.mse_loss(latent_action + latent_action_backward, torch.zeros_like(latent_action))
+                    
+                    # 보조 손실 계산 (로깅용 또는 선택적 사용)
+                    if config.log_consistency_details or config.use_auxiliary_consistency_losses:
+                        # cos_anti: 정방향과 역방향 벡터가 반대 방향인지 측정
+                        cos_sim = F.cosine_similarity(latent_action, latent_action_backward, dim=-1)
+                        loss_cos_anti = -cos_sim.mean()  # 반대 방향이어야 하므로 음수 코사인 유사도
+                        
+                        # mag: 정방향과 역방향 벡터의 크기 차이
+                        mag_forward = torch.norm(latent_action, p=2, dim=-1)
+                        mag_backward = torch.norm(latent_action_backward, p=2, dim=-1)
+                        loss_mag = F.mse_loss(mag_forward, mag_backward)
+            else:
+                # consistency loss를 사용하지 않는 경우 더미 값으로 설정
+                loss_consistency = torch.tensor(0.0, device=DEVICE, requires_grad=True)
+                if config.log_consistency_details or config.use_auxiliary_consistency_losses:
+                    loss_cos_anti = torch.tensor(0.0, device=DEVICE, requires_grad=True)
+                    loss_mag = torch.tensor(0.0, device=DEVICE, requires_grad=True)
+            # =================================================
+            # ===== Self-Consistency Loss 추가 부분 끝  ======
+            # =================================================
 
             # loss with true actions
             labeled_batch = next(labeled_dataloader_iter)
@@ -923,6 +985,11 @@ def train_mv(config: LAOMConfig, checkpoint_dir: str, config_path: str = None):
             label_obs, label_next_obs, label_future_obs, label_actions = [
                 labeled_batch[k].to(DEVICE) for k in ["obs", "next_obs", "future_obs", "actions"]
             ]
+            
+            # Camera IDs (조건부)
+            label_future_camera_ids = None
+            if config.use_camera_conditioning and "future_camera_ids" in labeled_batch:
+                label_future_camera_ids = labeled_batch["future_camera_ids"].to(DEVICE)
             
             # Save debug images from labeled dataloader
             if epoch == 0 and i == 0:
@@ -957,7 +1024,12 @@ def train_mv(config: LAOMConfig, checkpoint_dir: str, config_path: str = None):
 
             # update lapo
             with torch.autocast(DEVICE, dtype=torch.bfloat16):
-                _, _, pred_action, _ = lapo(label_obs_to_use, label_future_obs_to_use, predict_true_act=True)
+                _, _, pred_action, _ = lapo(
+                    label_obs_to_use, 
+                    label_future_obs_to_use, 
+                    predict_true_act=True,
+                    future_camera_ids=label_future_camera_ids  # 새로 추가
+                )
 
                 loss1 = F.mse_loss(pred_action, label_actions)
             
@@ -1153,6 +1225,14 @@ def train_mv(config: LAOMConfig, checkpoint_dir: str, config_path: str = None):
                 loss = loss0 + config.labeled_loss_coef * loss1 + current_contrastive_coef * loss_contrastive
             elif config.loss_type == "infonce":
                 loss = loss0 + config.labeled_loss_coef * loss1 + current_contrastive_coef * loss_contrastive
+            
+            # Self-Consistency Loss 추가 (선택적)
+            if config.use_consistency_loss:
+                loss = loss + config.consistency_coef * loss_consistency
+                
+                # 보조 consistency 손실 추가 (선택적)
+                if config.use_auxiliary_consistency_losses:
+                    loss = loss + config.auxiliary_consistency_coef * (loss_cos_anti + loss_mag)
 
             optim.zero_grad(set_to_none=True)
             loss.backward()
@@ -1194,13 +1274,14 @@ def train_mv(config: LAOMConfig, checkpoint_dir: str, config_path: str = None):
                 "lapo/mse_loss": loss0.item(),
                 "lapo/true_action_mse_loss": loss1.item(),
                 "lapo/contrastive_loss": loss_contrastive.item(),
+                "lapo/consistency_loss": loss_consistency.item(),
                 "lapo/state_probe_mse_loss": state_probe_loss.item(),
                 "lapo/action_probe_mse_loss": act_probe_loss.item(),
                 "lapo/state_action_probe_mse_loss": state_act_probe_loss.item(),
                 "lapo/throughput": total_tokens / (time.time() - start_time),
                 "lapo/learning_rate": scheduler.get_last_lr()[0],
                 "lapo/grad_norm": get_grad_norm(lapo).item(),
-                "lapo/target_obs_norm": torch.norm(next_obs_target, p=2, dim=-1).mean().item(),
+                "lapo/target_obs_norm": torch.norm(future_obs_target, p=2, dim=-1).mean().item(),
                 "lapo/online_obs_norm": torch.norm(latent_next_obs, p=2, dim=-1).mean().item(),
                 "lapo/latent_act_norm": torch.norm(latent_action, p=2, dim=-1).mean().item(),
                 "lapo/epoch": epoch,
@@ -1208,12 +1289,26 @@ def train_mv(config: LAOMConfig, checkpoint_dir: str, config_path: str = None):
                 "lapo/latent_act_std": z_a_std,
                 }
             
+            # Camera conditioning 관련 로깅 추가
+            if config.use_camera_conditioning:
+                log_data["lapo/camera_conditioning_enabled"] = 1.0
+                if future_camera_ids is not None:
+                    log_data["lapo/unique_future_cameras"] = len(torch.unique(future_camera_ids))
+            
             # Add loss-specific logging
             if config.loss_type == "triplet":
                 log_data["lapo/active_triplets_ratio"] = num_active_triplets.item() / obs.shape[0]
             elif config.loss_type == "infonce":
                 log_data["lapo/infonce_temperature"] = config.infonce_temperature
                 log_data["lapo/contrastive_loss_coef"] = current_contrastive_coef
+            
+            # Self-Consistency Loss 관련 로깅
+            if config.log_consistency_details:
+                log_data["lapo/consistency_coef"] = config.consistency_coef
+                if 'cos_sim' in locals():
+                    log_data["lapo/cos_anti"] = loss_cos_anti.item()
+                    log_data["lapo/mag_diff"] = loss_mag.item()
+                    log_data["lapo/consistency_cos_sim"] = cos_sim.mean().item()
             
             wandb.log(log_data)
             

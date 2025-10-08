@@ -693,6 +693,10 @@ def train_mv(config: LAOMConfig, checkpoint_dir: str, config_path: str = None):
     set_seed(config.seed)
     DEVICE = config.device
 
+    # wandb metric 정의 - Stage 1 (Disentangle)
+    wandb.define_metric("disentangle/total_steps")
+    wandb.define_metric("disentangle/*", step_metric="disentangle/total_steps")
+
     # --- Print view key configuration for debugging ---
     print("--- View Key Configuration ---")
     print(f"Training view_keys: {config.view_keys}")
@@ -883,7 +887,6 @@ def train_mv(config: LAOMConfig, checkpoint_dir: str, config_path: str = None):
     start_time = time.time()
     total_iterations = 0
     total_tokens = 0
-    step_counter = 0  # Add step counter for wandb logging
 
     labeled_dataloader_iter = iter(labeled_dataloader)
     base_contrastive_loss_coef = config.contrastive_loss_coef
@@ -896,8 +899,6 @@ def train_mv(config: LAOMConfig, checkpoint_dir: str, config_path: str = None):
 
         disentangled_laom.train()
         for i, batch in tqdm(enumerate(train_dataloader), total=len(train_dataloader), desc=f"Epoch {epoch+1}/{config.num_epochs}", leave=False):
-            if i == 1:
-                break
             if batch is None: continue
             total_tokens += config.batch_size * config.views_per_instance
             total_iterations += 1
@@ -1070,17 +1071,17 @@ def train_mv(config: LAOMConfig, checkpoint_dir: str, config_path: str = None):
                         [pred_future_v1_emb, pred_obs_v2_emb],
                         [target_future_v1_emb, target_obs_v2_emb]
                     )
-                    # just for validation
-                    loss_recon_both = compute_reconstruction_loss(
-                        [pred_future_v2_emb],
-                        [target_future_v2_emb]
-                    )
+                    
                 else:
                     loss_recon = compute_reconstruction_loss(
                         [pred_future_v1_emb, pred_obs_v2_emb, pred_future_v2_emb],
                         [target_future_v1_emb, target_obs_v2_emb, target_future_v2_emb]
                     )
-                
+                # just for validation
+                loss_recon_both = compute_reconstruction_loss(
+                    [pred_future_v2_emb],
+                    [target_future_v2_emb]
+                )
                 # ========== 5. Total Loss ==========
                 alpha = getattr(config, 'view_loss_coef', 1.0)
                 beta = getattr(config, 'zero_act_coef', 1.0)
@@ -1208,8 +1209,7 @@ def train_mv(config: LAOMConfig, checkpoint_dir: str, config_path: str = None):
             log_data["disentangle/delta_recon_coef"] = delta
             log_data["disentangle/contrastive_loss_coef"] = current_contrastive_coef
             
-            wandb.log(log_data, step=step_counter)
-            step_counter += 1
+            wandb.log(log_data)
             
             # Reset fixed offset after processing the batch
             # if config.use_dtw_filter and config.fixed_batch_offset:
@@ -1224,7 +1224,7 @@ def train_mv(config: LAOMConfig, checkpoint_dir: str, config_path: str = None):
         
         
         # 10에폭마다 체크포인트 저장
-        if (epoch + 1) % 400 == 0:
+        if (epoch + 1) % 100 == 0:
             # Save 3 models as dict
             models_dict = {
                 'laom_action': laom_action.state_dict(),
@@ -1375,6 +1375,10 @@ def evaluate_bc(env, actor, num_episodes, seed=0, device="cpu", action_decoder=N
 
 
 def train_bc(lam: DisentangledLAOM, config: BCConfig, checkpoint_dir: str, config_path: str = None):
+    # wandb metric 정의 - Stage 2 (BC)
+    wandb.define_metric("bc/total_steps")
+    wandb.define_metric("bc/*", step_metric="bc/total_steps")
+    
     # Trajectory-level splits for BC stage
     bc_train_demos, bc_val_demos = get_or_create_traj_splits(
         hdf5_path=config.data_path,
@@ -1500,7 +1504,6 @@ def train_bc(lam: DisentangledLAOM, config: BCConfig, checkpoint_dir: str, confi
     start_time = time.time()
     total_tokens = 0
     total_steps = 0
-    step_counter = 0  # Add step counter for wandb logging
     for epoch in trange(config.num_epochs, desc="Epochs"):
         actor.train()
         for batch in tqdm(train_dataloader, desc=f"Epoch {epoch+1}/{config.num_epochs}", leave=False):
@@ -1611,10 +1614,8 @@ def train_bc(lam: DisentangledLAOM, config: BCConfig, checkpoint_dir: str, confi
                     "bc/act_decoder_probe_mse_loss": decoder_loss.item(),
                     "bc/epoch": epoch,
                     "bc/total_steps": total_steps,
-                },
-                step=step_counter
+                }
             )
-            step_counter += 1
         
         # Validation loss 계산
         actor.eval()
@@ -1656,7 +1657,7 @@ def train_bc(lam: DisentangledLAOM, config: BCConfig, checkpoint_dir: str, confi
             "bc/val_mse_loss": val_loss,
             "bc/val_act_decoder_probe_mse_loss": val_decoder_loss,
             "bc/epoch": epoch,
-        }, step=step_counter)
+        })
         
         # 10에폭마다 체크포인트 저장
         if (epoch + 1) % 50 == 0:
@@ -1745,6 +1746,10 @@ def create_bc_transformer_decoder(config: DecoderConfig, dataset, actor: Actor):
 
 
 def train_act_decoder(actor: Actor, config: DecoderConfig, bc_config: BCConfig, checkpoint_dir: str, config_path: str = None):
+    # wandb metric 정의 - Stage 3 (Action Decoder)
+    wandb.define_metric("decoder/total_steps")
+    wandb.define_metric("decoder/*", step_metric="decoder/total_steps")
+    
     for p in actor.parameters():
         p.requires_grad_(False)
     actor.eval()
@@ -1889,7 +1894,6 @@ def train_act_decoder(actor: Actor, config: DecoderConfig, bc_config: BCConfig, 
     start_time = time.time()
     total_tokens = 0
     total_steps = 0
-    step_counter = 0  # Add step counter for wandb logging
 
     for epoch in trange(num_epochs, desc="Epochs"):
         for batch in tqdm(train_dataloader, desc=f"Epoch {epoch+1}/{num_epochs}", leave=False):
@@ -2018,10 +2022,8 @@ def train_act_decoder(actor: Actor, config: DecoderConfig, bc_config: BCConfig, 
                     "decoder/learning_rate": scheduler.get_last_lr()[0],
                     "decoder/epoch": epoch,
                     "decoder/total_steps": total_steps,
-                },
-                step=step_counter
+                }
             )
-            step_counter += 1
         
         # Validation loss 계산
         action_decoder.eval()
@@ -2062,7 +2064,7 @@ def train_act_decoder(actor: Actor, config: DecoderConfig, bc_config: BCConfig, 
             "decoder/val_direct_mse_loss": val_direct_loss,
             "decoder/val_latent_vs_direct_ratio": val_latent_loss / (val_direct_loss + 1e-8),
             "decoder/epoch": epoch,
-        }, step=step_counter)
+        })
         
         # Training mode로 복원
         action_decoder.train()
@@ -2430,7 +2432,18 @@ def train(config: Config, config_path: str = None):
         save_code=True,
     )
 
-    
+    # run 시작 시점에 config 즉시 저장
+    try:
+        run_config_path = os.path.join(checkpoint_dir, "config.yaml")
+        if config_path is not None and os.path.exists(config_path):
+            shutil.copy2(config_path, run_config_path)
+        else:
+            config_dict = convert_tuples_to_lists(asdict(config))
+            with open(run_config_path, 'w') as f:
+                yaml.dump(config_dict, f, default_flow_style=False, allow_unicode=True)
+        print(f"Run config 저장됨: {run_config_path}")
+    except Exception as e:
+        print(f"Run config 저장 실패: {e}")
 
     # stage 1: pretraining lapo on unlabeled dataset
     if config.lapo_checkpoint_path:
@@ -2465,18 +2478,6 @@ def train(config: Config, config_path: str = None):
         load_checkpoint(lapo, None, None, config.lapo_checkpoint_path)
 
     else:
-        # run 시작 시점에 config 즉시 저장
-        try:
-            run_config_path = os.path.join(checkpoint_dir, "config.yaml")
-            if config_path is not None and os.path.exists(config_path):
-                shutil.copy2(config_path, run_config_path)
-            else:
-                config_dict = convert_tuples_to_lists(asdict(config))
-                with open(run_config_path, 'w') as f:
-                    yaml.dump(config_dict, f, default_flow_style=False, allow_unicode=True)
-            print(f"Run config 저장됨: {run_config_path}")
-        except Exception as e:
-            print(f"Run config 저장 실패: {e}")
         print("=== Stage 1: LAPO Pretraining ===")
         lapo = train_mv(config=config.lapo, checkpoint_dir=checkpoint_dir, config_path=config_path)
     

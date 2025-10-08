@@ -539,6 +539,8 @@ class DCSMVInMemoryDataset(Dataset):
         all_views_obs = []
         all_views_next_obs = []
         all_views_future_obs = []
+        obs_camera_indices = []  # 새로 추가
+        future_camera_indices = []  # 새로 추가
         
         # Calculate offset once per moment, not per view
         current_traj_len = self.traj_lens[traj_idx]
@@ -570,6 +572,10 @@ class DCSMVInMemoryDataset(Dataset):
                 all_views_obs.append(obs)
                 all_views_next_obs.append(next_obs)
                 all_views_future_obs.append(future_obs)
+                
+                # Camera indices 추가
+                obs_camera_indices.append(self.view_keys_to_load.index(obs_view))
+                future_camera_indices.append(self.view_keys_to_load.index(future_obs_view))
         else:
             # Original behavior: all observations from the same view
             for view_key in self.view_keys_to_load:
@@ -580,6 +586,11 @@ class DCSMVInMemoryDataset(Dataset):
                 all_views_obs.append(obs)
                 all_views_next_obs.append(next_obs)
                 all_views_future_obs.append(future_obs)
+                
+                # Camera indices 추가 (obs와 future가 같은 view이므로 동일)
+                view_idx = self.view_keys_to_load.index(view_key)
+                obs_camera_indices.append(view_idx)
+                future_camera_indices.append(view_idx)
 
         # 3. 공통 정보 (액션, 상태, ID) 가져오기
         # 이 순간의 GT 액션은 모든 뷰에서 동일합니다.
@@ -602,7 +613,9 @@ class DCSMVInMemoryDataset(Dataset):
             "action_sequence": action_sequence,
             "state": state,
             "instance_id": instance_id,
-            "offset": offset - 1
+            "offset": offset - 1,
+            "obs_camera_idx": torch.tensor(obs_camera_indices, dtype=torch.long),  # 새로 추가
+            "future_camera_idx": torch.tensor(future_camera_indices, dtype=torch.long),  # 새로 추가
         }
 
 
@@ -676,6 +689,8 @@ class DCSMVTrueActionsDataset(IterableDataset):
             transition_idx = random.randint(0, traj_len - self.max_offset - 1)
 
             all_views_obs, all_views_next_obs, all_views_future_obs = [], [], []
+            obs_camera_indices = []  # 새로 추가
+            future_camera_indices = []  # 새로 추가
             
             max_possible_offset = traj_len - transition_idx - 1
             if self.fixed_offset is not None:
@@ -703,6 +718,10 @@ class DCSMVTrueActionsDataset(IterableDataset):
                     all_views_obs.append(obs)
                     all_views_next_obs.append(next_obs)
                     all_views_future_obs.append(future_obs)
+                    
+                    # Camera indices 추가
+                    obs_camera_indices.append(self.view_keys_to_load.index(obs_view))
+                    future_camera_indices.append(self.view_keys_to_load.index(future_obs_view))
             else:
                 # Original behavior: all observations from the same view
                 for view_key in self.view_keys_to_load:
@@ -713,6 +732,11 @@ class DCSMVTrueActionsDataset(IterableDataset):
                     all_views_obs.append(obs)
                     all_views_next_obs.append(next_obs)
                     all_views_future_obs.append(future_obs)
+                    
+                    # Camera indices 추가 (obs와 future가 같은 view이므로 동일)
+                    view_idx = self.view_keys_to_load.index(view_key)
+                    obs_camera_indices.append(view_idx)
+                    future_camera_indices.append(view_idx)
 
             action = torch.tensor(self.actions[traj_idx][transition_idx], device=self.device, dtype=torch.float32)
             state = torch.tensor(self.states[traj_idx][transition_idx], device=self.device, dtype=torch.float32)
@@ -733,7 +757,9 @@ class DCSMVTrueActionsDataset(IterableDataset):
                 "action_sequence": action_sequence, # Corrected key name
                 "state": state, # Corrected key name
                 "instance_id": instance_id, # Corrected key name
-                "offset": offset - 1 # Corrected key name
+                "offset": offset - 1, # Corrected key name
+                "obs_camera_idx": torch.tensor(obs_camera_indices, dtype=torch.long),  # 새로 추가
+                "future_camera_idx": torch.tensor(future_camera_indices, dtype=torch.long),  # 새로 추가
             }
 
 class DCSViewActionInMemoryDataset(Dataset):
@@ -1453,6 +1479,8 @@ def metric_learning_collate_fn(batch_list, K=4, mixed_view_sampling=False):
     final_states = []
     final_offsets = []
     final_instance_ids = []
+    final_obs_camera_indices = []  # 새로 추가
+    final_future_camera_indices = []  # 새로 추가
 
     for i in range(P):
         instance_group = batch_list[i]
@@ -1464,6 +1492,10 @@ def metric_learning_collate_fn(batch_list, K=4, mixed_view_sampling=False):
             final_obs.append(instance_group["obs"])  # 모든 positive samples
             final_next_obs.append(instance_group["next_obs"])
             final_future_obs.append(instance_group["future_obs"])
+            
+            # Camera indices 추가
+            final_obs_camera_indices.append(instance_group["obs_camera_idx"])
+            final_future_camera_indices.append(instance_group["future_camera_idx"])
             
             # 각 positive sample에 대해 동일한 action, state, offset, instance_id 할당
             final_actions.append(instance_group["action"].unsqueeze(0).repeat(num_positive_samples, 1))
@@ -1478,15 +1510,25 @@ def metric_learning_collate_fn(batch_list, K=4, mixed_view_sampling=False):
         else:
             # Original behavior: K개 뷰 샘플링
             num_available_views = instance_group["obs"].shape[0]
-            k_sample = min(K, num_available_views)
+            # k_sample = min(K, num_available_views)
+            k_sample = K
+            # if K > num_available_views:
+                # print(f"INFO: overriding K: {K} to num_available_views: {num_available_views}")
             if k_sample == 0:
                 continue
 
-            sampled_indices = random.sample(range(num_available_views), k_sample)
+            if K > num_available_views:
+                sampled_indices = random.choices(range(num_available_views), k=k_sample)
+            else:
+                sampled_indices = random.sample(range(num_available_views), k_sample)
             
             final_obs.append(instance_group["obs"][sampled_indices])
             final_next_obs.append(instance_group["next_obs"][sampled_indices])
             final_future_obs.append(instance_group["future_obs"][sampled_indices])
+            
+            # Camera indices 추가 (샘플링된 인덱스 사용)
+            final_obs_camera_indices.append(instance_group["obs_camera_idx"][sampled_indices])
+            final_future_camera_indices.append(instance_group["future_camera_idx"][sampled_indices])
             
             final_actions.append(instance_group["action"].unsqueeze(0).repeat(k_sample, 1))
             
@@ -1522,7 +1564,9 @@ def metric_learning_collate_fn(batch_list, K=4, mixed_view_sampling=False):
         "action_sequences_mask": action_sequences_mask,
         "states": torch.cat(final_states, dim=0),
         "offsets": torch.cat(final_offsets, dim=0),
-        "instance_ids": torch.cat(final_instance_ids, dim=0)
+        "instance_ids": torch.cat(final_instance_ids, dim=0),
+        "obs_camera_ids": torch.cat(final_obs_camera_indices, dim=0),  # 새로 추가
+        "future_camera_ids": torch.cat(final_future_camera_indices, dim=0),  # 새로 추가
     }
 
 

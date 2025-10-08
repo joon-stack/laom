@@ -23,6 +23,19 @@ class MLPBlock(nn.Module):
         return self.norm(x + self.mlp(x))
 
 
+class FiLMLayer(nn.Module):
+    """Feature-wise Linear Modulation layer"""
+    def __init__(self, hidden_dim, condition_dim):
+        super().__init__()
+        self.gamma = nn.Linear(condition_dim, hidden_dim)
+        self.beta = nn.Linear(condition_dim, hidden_dim)
+    
+    def forward(self, x, condition):
+        gamma = self.gamma(condition)
+        beta = self.beta(condition)
+        return gamma * x + beta
+
+
 class LatentActHead(nn.Module):
     def __init__(self, act_dim, emb_dim, hidden_dim, expand=4, dropout=0.0):
         super().__init__()
@@ -61,8 +74,11 @@ class LatentActHead(nn.Module):
 
 
 class LatentObsHead(nn.Module):
-    def __init__(self, act_dim, proj_dim, hidden_dim, expand=4, dropout=0.0):
+    def __init__(self, act_dim, proj_dim, hidden_dim, expand=4, dropout=0.0, camera_embedding_dim=None):
         super().__init__()
+        self.use_camera_conditioning = camera_embedding_dim is not None
+        
+        # 기존 코드 유지
         self.proj0 = nn.Linear(act_dim + proj_dim, hidden_dim)
         self.proj1 = nn.Linear(act_dim + hidden_dim, hidden_dim)
         self.proj2 = nn.Linear(act_dim + hidden_dim, hidden_dim)
@@ -71,11 +87,30 @@ class LatentObsHead(nn.Module):
         self.block0 = MLPBlock(hidden_dim, expand, dropout)
         self.block1 = MLPBlock(hidden_dim, expand, dropout)
         self.block2 = MLPBlock(hidden_dim, expand, dropout)
+        
+        # FiLM layers 추가 (camera conditioning 사용 시)
+        if self.use_camera_conditioning:
+            self.film0 = FiLMLayer(hidden_dim, camera_embedding_dim)
+            self.film1 = FiLMLayer(hidden_dim, camera_embedding_dim)
+            self.film2 = FiLMLayer(hidden_dim, camera_embedding_dim)
 
-    def forward(self, x, action):
+    def forward(self, x, action, camera_emb=None):
+        # Block 0
         x = self.block0(self.proj0(torch.concat([x, action], dim=-1)))
+        if self.use_camera_conditioning and camera_emb is not None:
+            x = self.film0(x, camera_emb)
+        
+        # Block 1
         x = self.block1(self.proj1(torch.concat([x, action], dim=-1)))
+        if self.use_camera_conditioning and camera_emb is not None:
+            x = self.film1(x, camera_emb)
+        
+        # Block 2
         x = self.block2(self.proj2(torch.concat([x, action], dim=-1)))
+        if self.use_camera_conditioning and camera_emb is not None:
+            x = self.film2(x, camera_emb)
+        
+        # Final projection
         x = self.proj_end(x)
         return x
 
@@ -502,10 +537,15 @@ class LAOMWithLabels(nn.Module):
         act_head_dropout=0.0,
         obs_head_dim=512,
         obs_head_dropout=0.0,
+        num_cameras=0,  # 새로 추가
+        camera_embedding_dim=64,  # 새로 추가
     ):
         super().__init__()
         self.inital_shape = shape
-
+        
+        # Camera conditioning 활성화 조건
+        self.use_camera_conditioning = num_cameras > 0
+        
         # encoder
         conv_stack = []
         for out_ch in encoder_channels:
@@ -521,17 +561,35 @@ class LAOMWithLabels(nn.Module):
         self.idm_head = LatentActHead(latent_act_dim, math.prod(shape), act_head_dim, dropout=act_head_dropout)
         self.true_actions_head = nn.Linear(latent_act_dim, true_act_dim)
 
-        self.fdm_head = LatentObsHead(latent_act_dim, math.prod(shape), obs_head_dim, dropout=obs_head_dropout)
+        self.fdm_head = LatentObsHead(
+            latent_act_dim, 
+            math.prod(shape), 
+            obs_head_dim, 
+            dropout=obs_head_dropout,
+            camera_embedding_dim=camera_embedding_dim if self.use_camera_conditioning else None
+        )
+        
+        # Camera embedding layer (조건부 생성)
+        if self.use_camera_conditioning:
+            self.camera_embedding = nn.Embedding(num_cameras, camera_embedding_dim)
+        
         self.final_encoder_shape = shape
         self.latent_act_dim = latent_act_dim
         self.apply(weight_init)
 
-    def forward(self, obs, next_obs, predict_true_act=False):
+    def forward(self, obs, next_obs, predict_true_act=False, future_camera_ids=None):
         # for faster forwad + unified batch norm stats, WARN: 2x batch size!
         obs_emb, next_obs_emb = self.encoder(torch.concat([obs, next_obs])).split(obs.shape[0])
 
         latent_action = self.idm_head(obs_emb.flatten(1), next_obs_emb.flatten(1))
-        latent_next_obs = self.fdm_head(obs_emb.flatten(1).detach(), latent_action)
+        
+        # Camera embedding 추출 (조건부)
+        camera_emb = None
+        if self.use_camera_conditioning and future_camera_ids is not None:
+            camera_emb = self.camera_embedding(future_camera_ids)
+        
+        # FDM with camera conditioning
+        latent_next_obs = self.fdm_head(obs_emb.flatten(1).detach(), latent_action, camera_emb)
         # TODO: use norm from encoder here too!
 
         if predict_true_act:
