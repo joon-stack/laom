@@ -1,0 +1,136 @@
+project: "mv"
+group: "mv-labels-camera-cond"
+name: "mv-labels-camera-cond"
+
+lapo:
+  # Camera conditioning 활성화
+  use_camera_conditioning: true
+  camera_embedding_dim: 64
+  
+  # Mixed view sampling 필수
+  mixed_view_sampling: true
+  positive_samples_per_instance: 4
+  views_per_instance: 1
+  
+  # View 설정
+  camera_num: 6
+  view_keys: [0, 1, 2, 3, 4, 5]
+  eval_view_keys: [0, 1, 2, 3, 4, 5]
+  
+  # 기존 설정들
+  num_epochs: 400
+  batch_size: 32
+  labeled_batch_size: 256
+  loss_type: "infonce"
+  infonce_temperature: 0.1
+  contrastive_loss_coef: 1.0
+  labeled_loss_coef: 0.05
+  cosine_loss: false
+  use_aug: false
+  future_obs_offset: 1
+  learning_rate: 3e-4
+  weight_decay: 0.0
+  warmup_epochs: 5
+  grad_norm: 1.0
+  latent_action_dim: 256
+  act_head_dim: 512
+  act_head_dropout: 0.0
+  obs_head_dim: 512
+  obs_head_dropout: 0.0
+  encoder_scale: 1
+  encoder_num_res_blocks: 1
+  encoder_dropout: 0.0
+  encoder_norm_out: true
+  encoder_deep: true
+  target_tau: 0.01
+  target_update_every: 1
+  frame_stack: 3
+  data_path: "data/test.hdf5"
+  eval_data_path: null
+  labeled_data_path: "data/labeled_test.hdf5"
+  seed: 0
+  num_workers: 4
+  normalize_triplet: true
+  filtering_type: "none"
+  dtw_threshold: 5.0
+  l2_threshold: 5.0
+  fixed_batch_offset: true
+  resize_size: 64
+  
+  # Dataset size settings
+  train_dataset_size: null
+  val_dataset_size: null
+  unlabeled_train_dataset_size: null
+  unlabeled_val_dataset_size: null
+  
+  # Trajectory-level splits
+  train_traj_num: null
+  val_traj_num: null
+  unlabeled_train_traj_num: null
+  unlabeled_val_traj_num: null
+
+bc:
+  num_epochs: 1
+  batch_size: 64
+  learning_rate: 3e-4
+  weight_decay: 0.0
+  warmup_epochs: 5
+  encoder_scale: 1
+  encoder_num_res_blocks: 2
+  encoder_deep: false
+  dropout: 0.0
+  use_aug: true
+  frame_stack: 3
+  data_path: "data/test.hdf5"
+  dcs_backgrounds_path: "DAVIS/JPEGImages/480p"
+  dcs_backgrounds_split: "train"
+  eval_episodes: 10
+  eval_seed: 0
+  seed: 0
+  camera_num: 20
+  view_keys: []
+  views_per_instance: 1
+  fixed_offset: 1
+  train_dataset_size: null
+  val_dataset_size: null
+  unlabeled_train_dataset_size: null
+  unlabeled_val_dataset_size: null
+  train_traj_num: null
+  val_traj_num: null
+  resize_size: 64
+  mixed_view_sampling: false
+  positive_samples_per_instance: 4
+
+decoder:
+  total_updates: 1
+  batch_size: 64
+  learning_rate: 3e-4
+  weight_decay: 0.0
+  warmup_epochs: 5
+  hidden_dim: 128
+  use_aug: true
+  dcs_backgrounds_path: "DAVIS/JPEGImages/480p"
+  dcs_backgrounds_split: "train"
+  eval_episodes: 10
+  eval_seed: 0
+  action_decoder_type: "simple"
+  bc_transformer_config_path: null
+  camera_num: 20
+  view_keys: []
+  views_per_instance: 1
+  frame_stack: 3
+  fixed_offset: 1
+  train_dataset_size: null
+  val_dataset_size: null
+  unlabeled_train_dataset_size: null
+  unlabeled_val_dataset_size: null
+  train_traj_num: null
+  val_traj_num: null
+  resize_size: 64
+  mixed_view_sampling: false
+  positive_samples_per_instance: 4
+
+seed: 0
+debug_dataloader: false
+lapo_checkpoint_path: null
+bc_checkpoint_path: null

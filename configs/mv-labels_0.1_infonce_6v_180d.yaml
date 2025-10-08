@@ -4,12 +4,12 @@ debug_dataloader: true
 
 lapo:
   num_epochs: 100
-  batch_size: 64
+  batch_size: 32
   labeled_batch_size: 16
   camera_num: 6
   view_keys: [0, 4, 8, 12, 16, 20]
   eval_view_keys: [10]
-  views_per_instance: 4
+  views_per_instance: 8
   contrastive_loss_coef: 0.1
   triplet_warmup_epochs: 0
   base_margin: 0.2
@@ -41,9 +41,9 @@ lapo:
   num_workers: 12
   normalize_triplet: False
   loss_type: "infonce"  # "triplet" or "infonce"
-  infonce_temperature: 0.1
+  infonce_temperature: 1.0
   # --- False Negative Filtering ---
-  filtering_type: "l2"  # "none", "dtw", or "l2"
+  filtering_type: "none"  # "none", "dtw", or "l2"
   dtw_threshold: 5.0
   l2_threshold: 5.0
   fixed_batch_offset: True
@@ -56,6 +56,13 @@ lapo:
   positive_samples_per_instance: 8
   # --- Image Resize ---
   resize_size: 64
+
+  # Self-Consistency Loss parameters
+  use_consistency_loss: false  # Self-consistency loss 사용 여부
+  consistency_coef: 1.0  # Cycle consistency loss 가중치
+  log_consistency_details: true  # 보조 손실들을 wandb에 로깅할지 여부
+  use_auxiliary_consistency_losses: false  # cos_anti와 mag 손실을 loss에 포함할지 여부
+  auxiliary_consistency_coef: 0.5  # cos_anti와 mag 손실의 가중치
 
 bc:
   num_epochs: 100
@@ -77,12 +84,12 @@ bc:
   eval_seed: 0
   # --- Image Resize ---
   resize_size: 64
-
   # Multi-view related settings
-  camera_num: 1
-  view_keys: [10]
+  camera_num: 21
+  view_keys: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
   views_per_instance: 1
   fixed_offset: 10
+
 
 decoder:
   total_updates: 2500
@@ -98,12 +105,12 @@ decoder:
   dcs_backgrounds_split: "train"
   eval_episodes: 25
   eval_seed: 0
-
   # Multi-view related settings
-  camera_num: 1
-  view_keys: [10]
+  camera_num: 21
+  view_keys: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
   views_per_instance: 1
   fixed_offset: 10
+
 
    # --- Image Resize ---
   resize_size: 64
